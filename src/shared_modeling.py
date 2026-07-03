@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, GridSearchCV
@@ -14,6 +15,97 @@ from sklearn.svm import SVC
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from xgboost import XGBClassifier
+
+
+def compute_resilience_score(df):
+    item_cols = [f'V2IA{i:02d}' for i in range(1, 26)]
+    out = df[['PublicID']].copy()
+    out['ResilienceTotalScore'] = df[item_cols].sum(axis=1)
+    out['ResilienceLevel'] = out['ResilienceTotalScore'].apply(
+        lambda s: 3 if s <= 75 else 2 if s <= 100 else 1
+    )
+    return out
+
+
+def compute_stress_average(df):
+    cols = [
+        'V1EA01', 'V1EA02a', 'V1EA02b', 'V1EA02c', 'V1EA02d', 'V1EA02e',
+        'V1EA02f', 'V1EA02g', 'V1EA02h', 'V1EA02i', 'V1EA02j', 'V1EA02k',
+        'V1EA02l',
+    ]
+    out = df[['PublicID']].copy()
+    out['stress_average'] = df[cols].mean(axis=1)
+    return out
+
+
+def compute_hassles_uplifts(df):
+    hassles_cols = [f'V3JA02{letter}' for letter in 'abcdefghij']
+    uplifts_cols = [f'V3JA01{letter}' for letter in 'abcdefghij']
+    out = df[['PublicID']].copy()
+    out['FrequencyOfHassles'] = df[hassles_cols].gt(0).sum(axis=1)
+    out['FrequencyOfUplifts'] = df[uplifts_cols].gt(0).sum(axis=1)
+    out['IntensityOfHassles'] = np.where(
+        out['FrequencyOfHassles'] > 0,
+        df[hassles_cols].sum(axis=1) / out['FrequencyOfHassles'],
+        0.0,
+    )
+    out['IntensityOfUplifts'] = np.where(
+        out['FrequencyOfUplifts'] > 0,
+        df[uplifts_cols].sum(axis=1) / out['FrequencyOfUplifts'],
+        0.0,
+    )
+    out['HassleUpliftFrequencyRatio'] = np.where(
+        out['FrequencyOfUplifts'] > 0,
+        out['FrequencyOfHassles'] / out['FrequencyOfUplifts'],
+        0.0,
+    )
+    out['HassleUpliftIntensityRatio'] = np.where(
+        out['IntensityOfUplifts'] > 0,
+        out['IntensityOfHassles'] / out['IntensityOfUplifts'],
+        0.0,
+    )
+    return out
+
+
+def compute_stress_level(df):
+    reverse_columns = ['V1AH04', 'V1AH05', 'V1AH07', 'V1AH08', 'V3AG04', 'V3AG05', 'V3AG07', 'V3AG08']
+    out = df[['PublicID']].copy()
+    out['StressTotalScore'] = (6 - df[reverse_columns]).sum(axis=1)
+    out['StressLevel'] = out['StressTotalScore'].apply(
+        lambda s: 0 if 0 <= s <= 13 else 0.5 if 14 <= s <= 26 else 1 if 27 <= s <= 40 else np.nan
+    )
+    return out
+
+
+def compute_edinburgh_scores(df):
+    out = df[['PublicID']].copy()
+    total = pd.Series(0, index=df.index, dtype='float64')
+    for i in range(1, 11):
+        col = f'V1CA{i:02d}'
+        if i == 10:
+            total += (df[col] - 4).abs()
+        elif i in {1, 2, 4}:
+            total += df[col] - 1
+        else:
+            total += (df[col] - 4).abs()
+    out['TotalEDINScore'] = total
+    out['SubEDINScore'] = (out['TotalEDINScore'] >= 10).astype(int)
+    return out
+
+
+def compute_stai_scores(df):
+    reverse = {1, 3, 6, 7, 10, 13, 14, 16, 19}
+    out = df[['PublicID']].copy()
+    total = pd.Series(0, index=df.index, dtype='float64')
+    for i in range(1, 21):
+        col = f'V1HA{i:02d}'
+        if i in reverse and i > 9:
+            total += (df[col] - 5).abs()
+        else:
+            total += df[col]
+    out['TotalSTAIScore'] = total
+    out['SubSTAIScore'] = (out['TotalSTAIScore'] >= 40).astype(int)
+    return out
 
 
 def make_master_split_ids(df, target_column='MH_outcome', id_column='PublicID', test_size=0.2, random_state=42):
@@ -59,20 +151,27 @@ def load_or_create_master_split_ids(
     return train_ids, test_ids
 
 
-def make_preprocessor(numeric_features, categorical_features=None):
-    """Impute and scale numeric features, and optionally encode categorical ones."""
+def make_preprocessor(numeric_features, categorical_features=None, impute=False):
+    """Build preprocessing for numeric and categorical features.
+
+    By default, missing values are passed through without imputation so that
+    downstream estimators that can handle missingness can do so directly.
+    Set ``impute=True`` to enable median/mode imputation.
+    """
     transformers = []
     if numeric_features:
-        numeric_pipe = SkPipeline(steps=[
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler()),
-        ])
+        numeric_steps = []
+        if impute:
+            numeric_steps.append(('imputer', SimpleImputer(strategy='median')))
+        numeric_steps.append(('scaler', StandardScaler()))
+        numeric_pipe = SkPipeline(steps=numeric_steps)
         transformers.append(('num', numeric_pipe, numeric_features))
     if categorical_features:
-        categorical_pipe = SkPipeline(steps=[
-            ('imputer', SimpleImputer(strategy='most_frequent')),
-            ('onehot', OneHotEncoder(handle_unknown='ignore')),
-        ])
+        categorical_steps = []
+        if impute:
+            categorical_steps.append(('imputer', SimpleImputer(strategy='most_frequent')))
+        categorical_steps.append(('onehot', OneHotEncoder(handle_unknown='ignore')))
+        categorical_pipe = SkPipeline(steps=categorical_steps)
         transformers.append(('cat', categorical_pipe, categorical_features))
     return ColumnTransformer(transformers=transformers, remainder='drop')
 
@@ -133,6 +232,7 @@ def run_model_experiment(
     model_name,
     numeric_features=None,
     categorical_features=None,
+    impute=False,
     scoring='f1_macro',
     cv=5,
     verbose=1,
@@ -141,13 +241,43 @@ def run_model_experiment(
     """Run the shared preprocessing, SMOTE, grid search, and evaluation flow."""
     estimator, param_grid = make_model_and_grid(model_name)
 
+    feature_columns = []
+    if numeric_features:
+        feature_columns.extend(numeric_features)
+    if categorical_features:
+        feature_columns.extend(categorical_features)
+
     if numeric_features:
         X_train = X_train.copy()
         X_test = X_test.copy()
         X_train[numeric_features] = X_train[numeric_features].apply(pd.to_numeric, errors='coerce')
         X_test[numeric_features] = X_test[numeric_features].apply(pd.to_numeric, errors='coerce')
 
-    preprocessor = make_preprocessor(numeric_features, categorical_features=categorical_features)
+    if not impute and feature_columns:
+        train_mask = X_train[feature_columns].notna().all(axis=1) & y_train.notna()
+        test_mask = X_test[feature_columns].notna().all(axis=1) & y_test.notna()
+        dropped_train = int((~train_mask).sum())
+        dropped_test = int((~test_mask).sum())
+        if dropped_train or dropped_test:
+            print(
+                f"Dropping rows with missing values because impute=False "
+                f"(train: {dropped_train}, test: {dropped_test})."
+            )
+        X_train = X_train.loc[train_mask].copy()
+        y_train = y_train.loc[X_train.index].copy()
+        X_test = X_test.loc[test_mask].copy()
+        y_test = y_test.loc[X_test.index].copy()
+
+    print(
+        f"Final dataset sizes for {model_name.upper()} "
+        f"(impute={impute}): train={len(X_train)}, test={len(X_test)}"
+    )
+
+    preprocessor = make_preprocessor(
+        numeric_features,
+        categorical_features=categorical_features,
+        impute=impute,
+    )
     pipeline = ImbPipeline(steps=[
         ('preprocessor', preprocessor),
         ('smote', SMOTE(random_state=42)),
@@ -187,15 +317,16 @@ def run_model_experiment(
             feature_names.extend(numeric_features)
         if categorical_features:
             feature_names.extend(categorical_features)
+    feature_names = np.asarray(feature_names)
     if model_name.lower() == 'svm':
         print('Skipping feature-level SVM output to keep notebook output compact.')
     elif hasattr(classifier, 'coef_'):
         print('Model Coefficients:')
-        for feature, coef in zip(feature_names, classifier.coef_[0]):
+        for feature, coef in zip(feature_names[: len(classifier.coef_[0])], classifier.coef_[0]):
             print(f"{feature}: {coef}")
     elif hasattr(classifier, 'feature_importances_'):
         print('Feature Importances:')
-        for feature, importance in zip(feature_names, classifier.feature_importances_):
+        for feature, importance in zip(feature_names[: len(classifier.feature_importances_)], classifier.feature_importances_):
             print(f"{feature}: {importance}")
 
     print(f"Evaluation Metrics for {model_name.upper()} with shared preprocessing and macro F1 grid search:")
