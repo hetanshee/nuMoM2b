@@ -81,7 +81,11 @@ def make_model_and_grid(model_name, random_state=42):
     """Return the estimator and hyperparameter grid for a supported model."""
     model_name = model_name.lower()
     if model_name == 'lr':
-        estimator = LogisticRegression(random_state=random_state, max_iter=5000, solver='saga')
+        estimator = LogisticRegression(
+            random_state=random_state,
+            max_iter=5000,
+            solver='saga',
+        )
         param_grid = {
             'classifier__C': [0.001, 0.01, 0.1, 1, 10, 100],
             'classifier__l1_ratio': [0.0, 0.25, 0.5, 0.75, 1.0],
@@ -127,7 +131,7 @@ def run_model_experiment(
     y_train,
     y_test,
     model_name,
-    numeric_features,
+    numeric_features=None,
     categorical_features=None,
     scoring='f1_macro',
     cv=5,
@@ -169,7 +173,9 @@ def run_model_experiment(
 
     classifier = best_model.named_steps['classifier']
     feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
-    if hasattr(classifier, 'coef_'):
+    if model_name.lower() == 'svm':
+        print('Skipping feature-level SVM output to keep notebook output compact.')
+    elif hasattr(classifier, 'coef_'):
         print('Model Coefficients:')
         for feature, coef in zip(feature_names, classifier.coef_[0]):
             print(f"{feature}: {coef}")
