@@ -34,39 +34,37 @@ Full results, including the complete methodology and cohort derivation, are repo
 
 ```
 nuMoM2b/
-├── src/             Domain-level analysis notebooks and helper modules
-├── Medication/      Exploratory analyses of medication-related variables
+├── src/             Analysis notebooks and helper modules
+├── Medication/      Exploratory medication analyses and derived tables
 ├── thesis.pdf       Complete thesis (authoritative methodology and results)
 └── README.md        This file
 ```
 
-The `src/` directory contains the domain-level analysis notebooks, grouped below by function. Because the underlying dataset and derived intermediate files cannot be redistributed, the notebooks are provided to show the analytical workflow, modelling approach, and implementation details supporting the thesis.
+The `src/` directory contains the notebooks and reusable code used for the thesis analyses. Because the underlying dataset and derived intermediate files cannot be redistributed, the notebooks are provided to show the analytical workflow, modelling approach, and implementation details supporting the thesis.
 
-**Preprocessing and exploratory analysis**
-- `Encoding.ipynb` — categorical encoding and continuous-variable scaling
-- `outcomes.ipynb` — outcome variable definition and cohort filtering
-- `kmeans.ipynb`, `Clustering.py`, `plotting_clusters.py` — exploratory clustering and visualisation utilities
+**Shared modeling code**
+- `shared_modeling.py` — common preprocessing, score computation, split management, and model-training helpers used across notebooks
 
-**Domain-specific models**
-- `Mother_demo.ipynb` — maternal demographics
-- `Demo_father.ipynb` — paternal demographics
-- `Maternal Health.ipynb` — pre-existing and pregnancy-related conditions
-- `Food_Model.ipynb` — nutrition and dietary quality
-- `Health_knowledge_model.ipynb` — health knowledge
-- `Physical Activity.ipynb` — physical activity
-- `Sleep_model.ipynb` — actigraphy-based sleep measures
-- `Drugs.ipynb` — medication-related variables
+**Mental health outcome models**
+- `mental_health_outcome/Combined.ipynb` — combined multi-domain mental health model
+- `mental_health_outcome/Maternal Health.ipynb` — maternal health feature set
+- `mental_health_outcome/Mother_demo.ipynb` — maternal demographics
+- `mental_health_outcome/Demo_father.ipynb` — paternal demographics
+- `mental_health_outcome/Food_Model.ipynb` — nutrition and dietary quality
+- `mental_health_outcome/Health_knowledge_model.ipynb` — health knowledge
+- `mental_health_outcome/Physical Activity.ipynb` — physical activity
+- `mental_health_outcome/Sleep_model.ipynb` — actigraphy-based sleep measures
+- `mental_health_outcome/Drugs.ipynb` — medication-related variables
 
-**Outcome-specific models**
-- `Baby_health.ipynb` — neonatal outcome modelling (low prevalence; see Key Results)
-- `Breastfeeding.ipynb` — breastfeeding intention modelling
+**Pregnancy outcome models**
+- `pregnancy_outcomes/` — notebook-based outcome modelling and feature preparation for pregnancy-related endpoints
 
-**Scoring**
-- `Scoring_model.ipynb`, `Scoring_new.ipynb` — risk scoring and evaluation
+**Exploratory analysis utilities**
+- `data_analysis/` — clustering and plotting helpers used during exploratory analysis
 
 The `Medication/` directory contains exploratory analyses of medication-related variables, including clustering of medications and their recorded reasons for use.
 
-> *Note: the repository also includes exploratory notebooks and helper scripts that reflect the broader thesis workflow. The thesis PDF should be treated as the complete reference for the final methodology and results.*
+> *Note: the older standalone scoring notebooks have been retired in favour of the shared modeling workflow in `shared_modeling.py`.*
 
 ---
 
