@@ -35,7 +35,7 @@ Full results, including the complete methodology and cohort derivation, are repo
 ```
 nuMoM2b/
 ├── src/             Analysis notebooks and helper modules
-├── Medication/      Exploratory medication analyses and derived tables
+├── src/Medication/  Exploratory medication analyses and derived tables
 ├── thesis.pdf       Complete thesis (authoritative methodology and results)
 └── README.md        This file
 ```
@@ -62,7 +62,7 @@ The `src/` directory contains the notebooks and reusable code used for the thesi
 **Exploratory analysis utilities**
 - `data_analysis/` — clustering and plotting helpers used during exploratory analysis
 
-The `Medication/` directory contains exploratory analyses of medication-related variables, including clustering of medications and their recorded reasons for use.
+The `src/Medication/` directory contains exploratory analyses of medication-related variables, including clustering of medications and their recorded reasons for use.
 
 > *Note: the older standalone scoring notebooks have been retired in favour of the shared modeling workflow in `shared_modeling.py`.*
 
