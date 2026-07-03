@@ -1,4 +1,5 @@
 import pandas as pd
+from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -24,6 +25,37 @@ def make_master_split_ids(df, target_column='MH_outcome', id_column='PublicID', 
         random_state=random_state,
         stratify=split_frame[target_column],
     )
+    return train_ids, test_ids
+
+
+def load_or_create_master_split_ids(
+    df,
+    split_path,
+    target_column='MH_outcome',
+    id_column='PublicID',
+    test_size=0.2,
+    random_state=42,
+):
+    """Load a persisted split if it exists, otherwise create and save one."""
+    split_path = Path(split_path)
+    if split_path.exists():
+        split_df = pd.read_csv(split_path)
+        train_ids = split_df.loc[split_df['split'] == 'train', id_column].tolist()
+        test_ids = split_df.loc[split_df['split'] == 'test', id_column].tolist()
+        return train_ids, test_ids
+
+    train_ids, test_ids = make_master_split_ids(
+        df,
+        target_column=target_column,
+        id_column=id_column,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    split_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        id_column: list(train_ids) + list(test_ids),
+        'split': ['train'] * len(train_ids) + ['test'] * len(test_ids),
+    }).to_csv(split_path, index=False)
     return train_ids, test_ids
 
 
