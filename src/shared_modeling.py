@@ -7,8 +7,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline as SkPipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import SVC
 from imblearn.over_sampling import SMOTE
@@ -140,6 +140,13 @@ def run_model_experiment(
 ):
     """Run the shared preprocessing, SMOTE, grid search, and evaluation flow."""
     estimator, param_grid = make_model_and_grid(model_name)
+
+    if numeric_features:
+        X_train = X_train.copy()
+        X_test = X_test.copy()
+        X_train[numeric_features] = X_train[numeric_features].apply(pd.to_numeric, errors='coerce')
+        X_test[numeric_features] = X_test[numeric_features].apply(pd.to_numeric, errors='coerce')
+
     preprocessor = make_preprocessor(numeric_features, categorical_features=categorical_features)
     pipeline = ImbPipeline(steps=[
         ('preprocessor', preprocessor),
@@ -172,7 +179,14 @@ def run_model_experiment(
     print(f"Best Macro F1 Score: {grid_search.best_score_:.4f}")
 
     classifier = best_model.named_steps['classifier']
-    feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
+    try:
+        feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
+    except AttributeError:
+        feature_names = []
+        if numeric_features:
+            feature_names.extend(numeric_features)
+        if categorical_features:
+            feature_names.extend(categorical_features)
     if model_name.lower() == 'svm':
         print('Skipping feature-level SVM output to keep notebook output compact.')
     elif hasattr(classifier, 'coef_'):
