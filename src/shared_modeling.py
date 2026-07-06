@@ -302,8 +302,20 @@ def run_model_experiment(
         'f1': f1_score(y_test, y_pred, average='macro'),
     }
 
-    y_score = best_model.predict_proba(X_test)[:, 1]
-    metrics['roc_auc'] = roc_auc_score(y_test, y_score)
+    y_score = best_model.predict_proba(X_test)
+    unique_classes = np.unique(pd.Series(y_test).dropna())
+    if len(unique_classes) == 2 and y_score.shape[1] >= 2:
+        metrics['roc_auc'] = roc_auc_score(y_test, y_score[:, 1])
+    elif y_score.shape[1] > 2:
+        metrics['roc_auc_ovr_macro'] = roc_auc_score(
+            y_test,
+            y_score,
+            multi_class='ovr',
+            average='macro',
+            labels=best_model.named_steps['classifier'].classes_,
+        )
+    else:
+        print('ROC AUC skipped: unable to compute a stable score for this target.')
 
     print('Best parameters found:', grid_search.best_params_)
     print(f"Best Macro F1 Score: {grid_search.best_score_:.4f}")
@@ -336,5 +348,7 @@ def run_model_experiment(
     print(f"F1-score: {metrics['f1']:.4f}")
     if 'roc_auc' in metrics:
         print(f"ROC AUC: {metrics['roc_auc']:.4f}")
+    if 'roc_auc_ovr_macro' in metrics:
+        print(f"ROC AUC (ovr macro): {metrics['roc_auc_ovr_macro']:.4f}")
 
     return best_model, y_pred, metrics
