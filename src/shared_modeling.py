@@ -3,10 +3,11 @@ import numpy as np
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import StandardScaler
@@ -15,6 +16,27 @@ from sklearn.svm import SVC
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from xgboost import XGBClassifier
+
+
+class AdaptiveSMOTE(SMOTE):
+    """SMOTE that shrinks k_neighbors when a CV fold is too small."""
+
+    def __init__(self, random_state=42, k_neighbors=5):
+        super().__init__(random_state=random_state, k_neighbors=k_neighbors)
+
+    def _fit_resample(self, X, y):
+        class_counts = pd.Series(y).value_counts()
+        minority_count = int(class_counts.min())
+
+        if minority_count < 2:
+            return X, y
+
+        original_k_neighbors = self.k_neighbors
+        self.k_neighbors = min(original_k_neighbors, minority_count - 1)
+        try:
+            return super()._fit_resample(X, y)
+        finally:
+            self.k_neighbors = original_k_neighbors
 
 
 def compute_resilience_score(df):
@@ -233,7 +255,7 @@ def run_model_experiment(
     numeric_features=None,
     categorical_features=None,
     impute=False,
-    scoring='f1_macro',
+    scoring='auto',
     cv=5,
     verbose=1,
     n_jobs=-1,
@@ -268,6 +290,27 @@ def run_model_experiment(
         X_test = X_test.loc[test_mask].copy()
         y_test = y_test.loc[X_test.index].copy()
 
+    label_encoder = None
+    if model_name.lower() == 'xgb':
+        label_encoder = LabelEncoder()
+        y_train = pd.Series(
+            label_encoder.fit_transform(y_train),
+            index=y_train.index,
+            name=y_train.name,
+        )
+        y_test = pd.Series(
+            label_encoder.transform(y_test),
+            index=y_test.index,
+            name=y_test.name,
+        )
+
+    unique_classes = np.unique(pd.Series(y_train).dropna())
+    is_binary = len(unique_classes) == 2
+    if scoring in (None, 'auto'):
+        # Binary tasks use standard F1; multiclass tasks use macro F1.
+        scoring = 'f1' if is_binary else 'f1_macro'
+    positive_label = sorted(unique_classes.tolist())[-1] if is_binary else None
+
     print(
         f"Final dataset sizes for {model_name.upper()} "
         f"(impute={impute}): train={len(X_train)}, test={len(X_test)}"
@@ -280,7 +323,7 @@ def run_model_experiment(
     )
     pipeline = ImbPipeline(steps=[
         ('preprocessor', preprocessor),
-        ('smote', SMOTE(random_state=42)),
+        ('smote', AdaptiveSMOTE(random_state=42)),
         ('classifier', estimator),
     ])
     grid_search = GridSearchCV(
@@ -295,15 +338,71 @@ def run_model_experiment(
     best_model = grid_search.best_estimator_
     y_pred = best_model.predict(X_test)
 
-    metrics = {
-        'accuracy': accuracy_score(y_test, y_pred),
-        'precision': precision_score(y_test, y_pred, average='macro'),
-        'recall': recall_score(y_test, y_pred, average='macro'),
-        'f1': f1_score(y_test, y_pred, average='macro'),
-    }
+    metrics = {'accuracy': accuracy_score(y_test, y_pred)}
+    if is_binary:
+        metrics['precision'] = precision_score(
+            y_test,
+            y_pred,
+            pos_label=positive_label,
+            zero_division=0,
+        )
+        metrics['recall'] = recall_score(
+            y_test,
+            y_pred,
+            pos_label=positive_label,
+            zero_division=0,
+        )
+        metrics['f1'] = f1_score(
+            y_test,
+            y_pred,
+            pos_label=positive_label,
+            zero_division=0,
+        )
+        metrics['macro_precision'] = precision_score(
+            y_test,
+            y_pred,
+            average='macro',
+            zero_division=0,
+        )
+        metrics['macro_recall'] = recall_score(
+            y_test,
+            y_pred,
+            average='macro',
+            zero_division=0,
+        )
+        metrics['macro_f1'] = f1_score(
+            y_test,
+            y_pred,
+            average='macro',
+            zero_division=0,
+        )
+    else:
+        metrics['precision'] = precision_score(
+            y_test,
+            y_pred,
+            average='macro',
+            zero_division=0,
+        )
+        metrics['recall'] = recall_score(
+            y_test,
+            y_pred,
+            average='macro',
+            zero_division=0,
+        )
+        metrics['f1'] = f1_score(
+            y_test,
+            y_pred,
+            average='macro',
+            zero_division=0,
+        )
+        metrics['weighted_f1'] = f1_score(
+            y_test,
+            y_pred,
+            average='weighted',
+            zero_division=0,
+        )
 
     y_score = best_model.predict_proba(X_test)
-    unique_classes = np.unique(pd.Series(y_test).dropna())
     if len(unique_classes) == 2 and y_score.shape[1] >= 2:
         metrics['roc_auc'] = roc_auc_score(y_test, y_score[:, 1])
     elif y_score.shape[1] > 2:
@@ -317,8 +416,26 @@ def run_model_experiment(
     else:
         print('ROC AUC skipped: unable to compute a stable score for this target.')
 
+    if len(unique_classes) > 2:
+        if label_encoder is not None:
+            labels = list(range(len(label_encoder.classes_)))
+            target_names = [str(label) for label in label_encoder.classes_]
+        else:
+            labels = sorted(unique_classes.tolist())
+            target_names = [str(label) for label in labels]
+        print('Per-class metrics:')
+        print(
+            classification_report(
+                y_test,
+                y_pred,
+                labels=labels,
+                target_names=target_names,
+                zero_division=0,
+            )
+        )
+
     print('Best parameters found:', grid_search.best_params_)
-    print(f"Best Macro F1 Score: {grid_search.best_score_:.4f}")
+    print(f"Best CV Score ({scoring}): {grid_search.best_score_:.4f}")
 
     classifier = best_model.named_steps['classifier']
     try:
@@ -341,11 +458,20 @@ def run_model_experiment(
         for feature, importance in zip(feature_names[: len(classifier.feature_importances_)], classifier.feature_importances_):
             print(f"{feature}: {importance}")
 
-    print(f"Evaluation Metrics for {model_name.upper()} with shared preprocessing and macro F1 grid search:")
+    print(f"Evaluation Metrics for {model_name.upper()} with shared preprocessing and adaptive CV scoring:")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall: {metrics['recall']:.4f}")
-    print(f"F1-score: {metrics['f1']:.4f}")
+    if is_binary:
+        print(f"Precision (positive class): {metrics['precision']:.4f}")
+        print(f"Recall (positive class): {metrics['recall']:.4f}")
+        print(f"F1 (positive class): {metrics['f1']:.4f}")
+        print(f"Macro Precision: {metrics['macro_precision']:.4f}")
+        print(f"Macro Recall: {metrics['macro_recall']:.4f}")
+        print(f"Macro F1: {metrics['macro_f1']:.4f}")
+    else:
+        print(f"Precision: {metrics['precision']:.4f}")
+        print(f"Recall: {metrics['recall']:.4f}")
+        print(f"Macro F1: {metrics['f1']:.4f}")
+        print(f"Weighted F1: {metrics['weighted_f1']:.4f}")
     if 'roc_auc' in metrics:
         print(f"ROC AUC: {metrics['roc_auc']:.4f}")
     if 'roc_auc_ovr_macro' in metrics:
