@@ -10,6 +10,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OrdinalEncoder
 from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import SVC
@@ -173,8 +174,15 @@ def load_or_create_master_split_ids(
     return train_ids, test_ids
 
 
-def make_preprocessor(numeric_features, categorical_features=None, impute=False):
-    """Build preprocessing for numeric and categorical features.
+def make_preprocessor(
+    numeric_features,
+    ordinal_features=None,
+    ordinal_feature_categories=None,
+    binary_features=None,
+    categorical_features=None,
+    impute=False,
+):
+    """Build preprocessing for numeric, ordinal, binary, and categorical features.
 
     By default, missing values are passed through without imputation so that
     downstream estimators that can handle missingness can do so directly.
@@ -188,6 +196,37 @@ def make_preprocessor(numeric_features, categorical_features=None, impute=False)
         numeric_steps.append(('scaler', StandardScaler()))
         numeric_pipe = SkPipeline(steps=numeric_steps)
         transformers.append(('num', numeric_pipe, numeric_features))
+    if ordinal_features:
+        if not ordinal_feature_categories:
+            raise ValueError(
+                'ordinal_feature_categories must be provided for ordinal_features '
+                'so the intended order is preserved.'
+            )
+        ordinal_steps = []
+        if impute:
+            ordinal_steps.append(('imputer', SimpleImputer(strategy='most_frequent')))
+        ordinal_categories = [ordinal_feature_categories[feature] for feature in ordinal_features]
+        ordinal_steps.append(
+            (
+                'ordinal',
+                OrdinalEncoder(
+                    categories=ordinal_categories,
+                    handle_unknown='use_encoded_value',
+                    unknown_value=-1,
+                    dtype=np.float64,
+                ),
+            )
+        )
+        ordinal_pipe = SkPipeline(steps=ordinal_steps)
+        transformers.append(('ord', ordinal_pipe, ordinal_features))
+    if binary_features:
+        if impute:
+            binary_pipe = SkPipeline(
+                steps=[('imputer', SimpleImputer(strategy='most_frequent'))]
+            )
+            transformers.append(('bin', binary_pipe, binary_features))
+        else:
+            transformers.append(('bin', 'passthrough', binary_features))
     if categorical_features:
         categorical_steps = []
         if impute:
@@ -254,6 +293,9 @@ def run_model_experiment(
     model_name,
     numeric_features=None,
     categorical_features=None,
+    ordinal_features=None,
+    ordinal_feature_categories=None,
+    binary_features=None,
     impute=False,
     scoring='auto',
     cv=5,
@@ -266,6 +308,10 @@ def run_model_experiment(
     feature_columns = []
     if numeric_features:
         feature_columns.extend(numeric_features)
+    if ordinal_features:
+        feature_columns.extend(ordinal_features)
+    if binary_features:
+        feature_columns.extend(binary_features)
     if categorical_features:
         feature_columns.extend(categorical_features)
 
@@ -274,6 +320,31 @@ def run_model_experiment(
         X_test = X_test.copy()
         X_train[numeric_features] = X_train[numeric_features].apply(pd.to_numeric, errors='coerce')
         X_test[numeric_features] = X_test[numeric_features].apply(pd.to_numeric, errors='coerce')
+    if binary_features:
+        X_train = X_train.copy()
+        X_test = X_test.copy()
+        X_train[binary_features] = X_train[binary_features].apply(pd.to_numeric, errors='coerce')
+        X_test[binary_features] = X_test[binary_features].apply(pd.to_numeric, errors='coerce')
+
+    resolved_ordinal_categories = None
+    if ordinal_features:
+        resolved_ordinal_categories = {}
+        for feature in ordinal_features:
+            if ordinal_feature_categories and feature in ordinal_feature_categories:
+                resolved_ordinal_categories[feature] = list(ordinal_feature_categories[feature])
+                continue
+
+            series = X_train[feature]
+            if pd.api.types.is_categorical_dtype(series) and series.cat.ordered:
+                resolved_ordinal_categories[feature] = list(series.cat.categories)
+            elif pd.api.types.is_numeric_dtype(series):
+                resolved_ordinal_categories[feature] = sorted(pd.unique(series.dropna()).tolist())
+            else:
+                raise ValueError(
+                    f"Ordinal feature '{feature}' needs an explicit order. "
+                    "Pass ordinal_feature_categories or make the column an ordered "
+                    "pandas Categorical."
+                )
 
     if not impute and feature_columns:
         train_mask = X_train[feature_columns].notna().all(axis=1) & y_train.notna()
@@ -318,6 +389,9 @@ def run_model_experiment(
 
     preprocessor = make_preprocessor(
         numeric_features,
+        ordinal_features=ordinal_features,
+        ordinal_feature_categories=resolved_ordinal_categories,
+        binary_features=binary_features,
         categorical_features=categorical_features,
         impute=impute,
     )
