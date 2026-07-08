@@ -3,7 +3,15 @@ import numpy as np
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    classification_report,
+    confusion_matrix,
+)
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -11,12 +19,17 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import OrdinalEncoder
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.decomposition import PCA
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import SVC
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from xgboost import XGBClassifier
+from sklearn.metrics import ConfusionMatrixDisplay, RocCurveDisplay
+from sklearn.inspection import permutation_importance
+import matplotlib.pyplot as plt
+import shap
 
 
 class AdaptiveSMOTE(SMOTE):
@@ -38,6 +51,178 @@ class AdaptiveSMOTE(SMOTE):
             return super()._fit_resample(X, y)
         finally:
             self.k_neighbors = original_k_neighbors
+
+
+def create_pipeline(preprocessor, classifier, use_smote=True, poly_features=False, pca_components=None, smote_class=SMOTE):
+    """Create a simple preprocessing/classifier pipeline for notebook experiments."""
+    steps = [('preprocessor', preprocessor)]
+
+    if pca_components:
+        steps.append(('pca', PCA(n_components=pca_components)))
+
+    if poly_features:
+        steps.append(('poly', PolynomialFeatures(degree=2, include_bias=False)))
+
+    if use_smote:
+        steps.append(('smote', smote_class(random_state=42)))
+
+    steps.append(('classifier', classifier))
+    return ImbPipeline(steps=steps)
+
+
+def get_feature_names_from_pipeline(model, X_train=None):
+    """Return feature names after preprocessing when a pipeline is used."""
+    if hasattr(model, 'named_steps') and 'preprocessor' in model.named_steps:
+        try:
+            return np.asarray(model.named_steps['preprocessor'].get_feature_names_out())
+        except Exception:
+            pass
+    if X_train is not None:
+        return np.asarray(X_train.columns)
+    return None
+
+
+def plot_confusion_matrix_for_model(model, X_test, y_test, labels=None, title='Confusion Matrix'):
+    y_pred = model.predict(X_test)
+    y_true = pd.Series(y_test).dropna()
+    y_pred = pd.Series(y_pred)
+    if labels is None:
+        labels = np.unique(pd.concat([y_true, y_pred], ignore_index=True))
+    else:
+        labels = np.unique(np.concatenate([np.asarray(labels), np.unique(pd.concat([y_true, y_pred], ignore_index=True))]))
+    cm = confusion_matrix(y_test, y_pred, labels=labels)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot(cmap='Blues', values_format='d')
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_roc_curve_for_model(model, X_test, y_test, title='ROC Curve'):
+    if not hasattr(model, 'predict_proba'):
+        print('ROC curve skipped: model does not expose predict_proba().')
+        return
+    unique_classes = np.unique(pd.Series(y_test).dropna())
+    if len(unique_classes) != 2:
+        print('ROC curve skipped: multiclass targets are not plotted as a single ROC curve.')
+        return
+    y_score = model.predict_proba(X_test)[:, 1]
+    RocCurveDisplay.from_predictions(y_test, y_score)
+    plt.title(f"{title} (AUC={roc_auc_score(y_test, y_score):.3f})")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_model_feature_importance(model, X_train=None, top_n=20, title='Feature Importance'):
+    feature_names = get_feature_names_from_pipeline(model, X_train)
+    classifier = model.named_steps['classifier'] if hasattr(model, 'named_steps') and 'classifier' in model.named_steps else model
+
+    if hasattr(classifier, 'feature_importances_'):
+        importances = classifier.feature_importances_
+    elif hasattr(classifier, 'coef_'):
+        importances = np.abs(np.ravel(classifier.coef_))
+    else:
+        print('Feature importance skipped: model does not expose coefficients or feature_importances_.')
+        return None
+
+    if feature_names is None:
+        feature_names = np.array([f'feature_{i}' for i in range(len(importances))])
+    else:
+        feature_names = np.asarray(feature_names)[: len(importances)]
+        importances = importances[: len(feature_names)]
+
+    fi = pd.DataFrame({'feature': feature_names, 'importance': importances})
+    fi = fi.sort_values('importance', ascending=False).head(top_n)
+    plt.figure(figsize=(10, max(4, 0.35 * len(fi))))
+    plt.barh(fi['feature'][::-1], fi['importance'][::-1])
+    plt.title(title)
+    plt.xlabel('Importance')
+    plt.tight_layout()
+    plt.show()
+    return fi
+
+
+def plot_permutation_importance_for_model(model, X_test, y_test, top_n=20, title='Permutation Importance'):
+    feature_names = np.asarray(X_test.columns) if hasattr(X_test, 'columns') else np.array([f'feature_{i}' for i in range(X_test.shape[1])]) if hasattr(X_test, 'shape') else get_feature_names_from_pipeline(model, X_test)
+    result = permutation_importance(model, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1)
+
+    if feature_names is None:
+        feature_names = np.array([f'feature_{i}' for i in range(len(result.importances_mean))])
+    else:
+        feature_names = np.asarray(feature_names)[: len(result.importances_mean)]
+
+    pi = pd.DataFrame({
+        'feature': feature_names,
+        'importance_mean': result.importances_mean,
+        'importance_std': result.importances_std,
+    }).sort_values('importance_mean', ascending=False).head(top_n)
+
+    plt.figure(figsize=(10, max(4, 0.35 * len(pi))))
+    plt.barh(pi['feature'][::-1], pi['importance_mean'][::-1], xerr=pi['importance_std'][::-1])
+    plt.title(title)
+    plt.xlabel('Permutation Importance')
+    plt.tight_layout()
+    plt.show()
+    return pi
+
+
+def plot_shap_summary_for_model(model, X_train, X_test, max_display=20, sample_size=500):
+    """Generate SHAP summary plots for tree-based or linear models when supported."""
+    classifier = model.named_steps['classifier'] if hasattr(model, 'named_steps') and 'classifier' in model.named_steps else model
+    feature_names = get_feature_names_from_pipeline(model, X_train)
+
+    X_shap = X_test.sample(min(sample_size, len(X_test)), random_state=42) if len(X_test) > sample_size else X_test
+
+    try:
+        if hasattr(model, 'named_steps') and 'preprocessor' in model.named_steps:
+            X_shap_transformed = model.named_steps['preprocessor'].transform(X_shap)
+        else:
+            X_shap_transformed = X_shap
+
+        explainer = shap.Explainer(classifier, X_shap_transformed)
+        shap_values = explainer(X_shap_transformed)
+        shap.summary_plot(shap_values, X_shap_transformed, feature_names=feature_names, max_display=max_display, show=True)
+        return shap_values
+    except Exception as exc:
+        print(f'SHAP skipped: {exc}')
+        return None
+
+
+def run_interpretability_suite(model, X_train, X_test, y_test, labels=None, top_n=20):
+    """Run the standard interpretability outputs."""
+    plot_confusion_matrix_for_model(model, X_test, y_test, labels=labels)
+    plot_roc_curve_for_model(model, X_test, y_test)
+    plot_model_feature_importance(model, X_train=X_train, top_n=top_n)
+    plot_permutation_importance_for_model(model, X_test, y_test, top_n=top_n)
+    plot_shap_summary_for_model(model, X_train, X_test, max_display=top_n)
+
+
+def resolve_ordinal_categories(series, explicit_categories=None):
+    """Resolve the encoded category order for an ordinal feature.
+
+    Explicit categories win. Otherwise we accept ordered categoricals, numeric
+    dtypes, and numeric-looking string/object codes such as "1", "2", "10".
+    """
+    if explicit_categories is not None:
+        return list(explicit_categories)
+
+    if pd.api.types.is_categorical_dtype(series) and series.cat.ordered:
+        return list(series.cat.categories)
+
+    if pd.api.types.is_numeric_dtype(series):
+        return sorted(pd.unique(series.dropna()).tolist())
+
+    non_null = series.dropna()
+    coerced = pd.to_numeric(non_null, errors='coerce')
+    if not non_null.empty and coerced.notna().all():
+        ordered = non_null.iloc[np.argsort(coerced.to_numpy())]
+        return ordered.drop_duplicates().tolist()
+
+    raise ValueError(
+        f"Ordinal feature '{series.name}' needs an explicit order. "
+        "Pass ordinal_feature_categories or make the column an ordered "
+        "pandas Categorical."
+    )
 
 
 def compute_resilience_score(df):
@@ -129,6 +314,340 @@ def compute_stai_scores(df):
     out['TotalSTAIScore'] = total
     out['SubSTAIScore'] = (out['TotalSTAIScore'] >= 40).astype(int)
     return out
+
+
+def build_combined_feature_lists(
+    include_maternal_physical=True,
+    include_mental_health=True,
+    include_paternal=True,
+    include_drugs=True,
+    include_food=True,
+    include_health_knowledge=True,
+    include_mother_demo=True,
+    include_physical_activity=True,
+    include_sleep=True,
+):
+    """Return the shared feature typing used by the combined outcome notebooks.
+
+    The returned lists reflect the latest typing from the domain-specific notebooks:
+    - Maternal health: oDM/acog_PEgHTN are categorical, ChronHTN is binary.
+    - Mother demo: Age_at_V1 is numeric, CRace is categorical, V1AF02/V1AF14/V1AF10 are ordinal,
+      and has_healthcare is binary.
+    - Drugs and health knowledge are binary feature sets.
+    - Food includes PRENATALAMOUNT as ordinal.
+    """
+    numeric_features = []
+    categorical_features = []
+    ordinal_features = []
+    binary_features = []
+
+    if include_maternal_physical:
+        categorical_features.extend(['oDM', 'acog_PEgHTN'])
+        binary_features.append('ChronHTN')
+    if include_mental_health:
+        numeric_features.extend([
+            'ResilienceTotalScore',
+            'stress_average',
+            'FrequencyOfHassles',
+            'FrequencyOfUplifts',
+            'IntensityOfHassles',
+            'IntensityOfUplifts',
+            'HassleUpliftFrequencyRatio',
+            'HassleUpliftIntensityRatio',
+            'StressTotalScore',
+        ])
+        binary_features.extend(['ResilienceLevel', 'StressLevel'])
+    if include_paternal:
+        numeric_features.extend(['V2AF13', 'V2AF15'])
+    if include_food:
+        numeric_features.extend([
+            'DT_FOLAC',
+            'DT_CALC',
+            'VITD_MCG',
+            'TOTAL_CHOLINE',
+            'DT_SODI',
+            'PRENATALYEARS',
+            'AHEI2010',
+            'AHEI_ALCDRKS',
+            'AHEI_SODIUM',
+            'AHEI_PUFAPCT',
+            'AHEI_DHAEPA',
+            'AHEI_TRFATPCT',
+            'AHEI_RMEATS',
+            'AHEI_NUTLEGS',
+            'AHEI_SUGBEVS',
+            'AHEI_WGRAINS',
+            'AHEI_FRUITS',
+            'AHEI_VEGS',
+            'DT_ALCO',
+            'DT_CAFFN',
+            'DT_FIBE',
+            'DT_SUG_T',
+            'DT_CHOL',
+            'DT_PFAT',
+            'DT_MFAT',
+            'DT_SFAT',
+            'DT_TFAT',
+            'DT_CARB',
+            'DT_KCAL',
+            'DT_PROT',
+            'DT_VITC',
+            'DT_VB12',
+            'DT_VITB6',
+            'DT_NIAC',
+            'DT_RIBO',
+            'DT_THIA',
+            'DT_IRON',
+            'DT_TOTN3',
+        ])
+        ordinal_features.append('PRENATALAMOUNT')
+    if include_physical_activity:
+        numeric_features.extend(['V2AJ01a2', 'V2AJ01a1'])
+    if include_mother_demo:
+        numeric_features.append('Age_at_V1')
+        categorical_features.append('CRace')
+        ordinal_features.extend(['V1AF02', 'V1AF14', 'V1AF10'])
+        binary_features.append('has_healthcare')
+    if include_drugs:
+        binary_features.extend(['V2AH01', 'V2AH02', 'V2AH03', 'V2AH04', 'V2AH05', 'V2AH06'])
+    if include_health_knowledge:
+        binary_features.extend([
+            'V1AD02a',
+            'V1AD02b',
+            'V1AD02c',
+            'V1AD02d',
+            'V1AD02e',
+            'V1AD02f',
+            'V1AD02g',
+            'V1AD02h',
+            'V1AD02i',
+            'V1AD02j',
+            'V1AD02k',
+        ])
+    sleep_features = [
+        'rest_dur_avg_all_Mod',
+        'rest_sleeptime_avg_all_Mod',
+        'sleep_dur_avg_all_Mod',
+        'sleep_sleeptime_avg_all_Mod',
+        'sleep_Frag_avg_all_Mod',
+        'sleep_WASO_avg_all_Mod',
+        'sleep_SE_avg_all_Mod',
+        'rest_sleeptime_avg_wkday_Mod',
+    ] if include_sleep else []
+    numeric_features.extend(sleep_features)
+    feature_columns = numeric_features + ordinal_features + binary_features + categorical_features
+    return {
+        'numeric_features': numeric_features,
+        'categorical_features': categorical_features,
+        'ordinal_features': ordinal_features,
+        'binary_features': binary_features,
+        'feature_columns': feature_columns,
+        'sleep_features': sleep_features,
+    }
+
+
+def build_combined_feature_frame(
+    data_dir,
+    outcome_path=None,
+    outcome_column=None,
+    outcome_encoding=None,
+    outcome_replace_map=None,
+    include_outcome=True,
+    include_maternal_physical=True,
+    include_mental_health=True,
+    include_paternal=True,
+    include_drugs=True,
+    include_food=True,
+    include_health_knowledge=True,
+    include_mother_demo=True,
+    include_physical_activity=True,
+    include_sleep=True,
+):
+    """Load and merge the shared spreadsheet-derived features used by the notebooks."""
+    data_dir = Path(data_dir)
+    feature_lists = build_combined_feature_lists(
+        include_maternal_physical=include_maternal_physical,
+        include_mental_health=include_mental_health,
+        include_paternal=include_paternal,
+        include_drugs=include_drugs,
+        include_food=include_food,
+        include_health_knowledge=include_health_knowledge,
+        include_mother_demo=include_mother_demo,
+        include_physical_activity=include_physical_activity,
+        include_sleep=include_sleep,
+    )
+
+    maternal_physical_features = ['oDM', 'acog_PEgHTN', 'ChronHTN']
+    v2i_cols = ['PublicID'] + [f'V2IA{i:02d}' for i in range(1, 26)]
+    v1e_cols = [
+        'PublicID', 'V1EA01', 'V1EA02a', 'V1EA02b', 'V1EA02c', 'V1EA02d',
+        'V1EA02e', 'V1EA02f', 'V1EA02g', 'V1EA02h', 'V1EA02i', 'V1EA02j',
+        'V1EA02k', 'V1EA02l',
+    ]
+    v3j_cols = ['PublicID'] + [f'V3JA01{letter}' for letter in 'abcdefghij'] + [f'V3JA02{letter}' for letter in 'abcdefghij']
+    v1a_stress_cols = ['PublicID', 'V1AH04', 'V1AH05', 'V1AH07', 'V1AH08']
+    v3a_stress_cols = ['PublicID', 'V3AG04', 'V3AG05', 'V3AG07', 'V3AG08']
+    paternal_features = ['V2AF13', 'V2AF15']
+    drug_features = ['V2AH01', 'V2AH02', 'V2AH03', 'V2AH04', 'V2AH05', 'V2AH06']
+    food_features = [
+        'DT_FOLAC', 'DT_CALC', 'VITD_MCG', 'TOTAL_CHOLINE', 'DT_SODI',
+        'PRENATALYEARS', 'PRENATALAMOUNT', 'AHEI2010', 'AHEI_ALCDRKS',
+        'AHEI_SODIUM', 'AHEI_PUFAPCT', 'AHEI_DHAEPA', 'AHEI_TRFATPCT',
+        'AHEI_RMEATS', 'AHEI_NUTLEGS', 'AHEI_SUGBEVS', 'AHEI_WGRAINS',
+        'AHEI_FRUITS', 'AHEI_VEGS', 'DT_ALCO', 'DT_CAFFN', 'DT_FIBE',
+        'DT_SUG_T', 'DT_CHOL', 'DT_PFAT', 'DT_MFAT', 'DT_SFAT', 'DT_TFAT',
+        'DT_CARB', 'DT_KCAL', 'DT_PROT', 'DT_VITC', 'DT_VB12', 'DT_VITB6',
+        'DT_NIAC', 'DT_RIBO', 'DT_THIA', 'DT_IRON', 'DT_TOTN3',
+    ]
+    health_knowledge_features = [
+        'V1AD02a', 'V1AD02b', 'V1AD02c', 'V1AD02d', 'V1AD02e', 'V1AD02f',
+        'V1AD02g', 'V1AD02h', 'V1AD02i', 'V1AD02j', 'V1AD02k',
+    ]
+    mother_numeric_features = ['Age_at_V1', 'V1AF02', 'V1AF10']
+    mother_categorical_features = ['CRace', 'V1AF14']
+    healthcare_response_columns = ['V1AF15a', 'V1AF15b', 'V1AF15c', 'V1AF15d', 'V1AF15e', 'V1AF15f', 'V1AF15g']
+    physical_activity_features = ['V2AJ01a2', 'V2AJ01a1']
+    sleep_features = feature_lists['sleep_features']
+
+    df_maternal_physical = None
+    if include_maternal_physical:
+        df_maternal_physical = pd.read_csv(
+            data_dir / 'PREGNANCY_OUTCOMES.csv',
+            usecols=maternal_physical_features + ['PublicID'],
+        )
+    df_v2i = None
+    df_v1e = None
+    df_v3j = None
+    df_v1a_stress = None
+    df_v3a_stress = None
+    if include_mental_health:
+        df_v2i = pd.read_csv(data_dir / 'V2I.csv', usecols=v2i_cols)
+        df_v1e = pd.read_csv(data_dir / 'V1E.CSV', usecols=v1e_cols, encoding='ISO-8859-1')
+        df_v3j = pd.read_csv(data_dir / 'V3J.csv', usecols=v3j_cols)
+        df_v1a_stress = pd.read_csv(data_dir / 'V1A.CSV', usecols=v1a_stress_cols)
+        df_v3a_stress = pd.read_csv(data_dir / 'V3A.CSV', usecols=v3a_stress_cols)
+
+    df_paternal = None
+    if include_paternal:
+        df_paternal = pd.read_csv(data_dir / 'V2A.csv', usecols=paternal_features + ['PublicID'], low_memory=False)
+        df_paternal[paternal_features] = df_paternal[paternal_features].replace({'R': np.nan, 'D': np.nan})
+        df_paternal[paternal_features] = df_paternal[paternal_features].apply(pd.to_numeric, errors='coerce')
+
+    df_drugs = None
+    if include_drugs:
+        df_drugs = pd.read_csv(data_dir / 'V2A.csv', usecols=drug_features + ['PublicID'], low_memory=False)
+        df_drugs = df_drugs.replace({'R': np.nan, 'D': np.nan})
+        df_drugs[drug_features] = df_drugs[drug_features].apply(pd.to_numeric, errors='coerce')
+
+    df_food = None
+    if include_food:
+        df_food = pd.read_csv(data_dir / 'FOOD_FREQUENCY_ANALYSIS.csv', usecols=food_features + ['PublicID'])
+        df_food[food_features] = df_food[food_features].apply(pd.to_numeric, errors='coerce')
+
+    df_health_knowledge = None
+    if include_health_knowledge:
+        df_health_knowledge = pd.read_csv(data_dir / 'V1A.csv', usecols=health_knowledge_features + ['PublicID'])
+        df_health_knowledge[health_knowledge_features] = df_health_knowledge[health_knowledge_features].apply(pd.to_numeric, errors='coerce')
+
+    df_mother_demo = None
+    if include_mother_demo:
+        df_mother_num = pd.read_csv(
+            data_dir / 'V1A.CSV',
+            usecols=['V1AF02', 'V1AF14', 'V1AF10', 'PublicID'],
+            encoding='latin-1',
+        )
+        df_mother_demo = pd.read_csv(
+            data_dir / 'DEMOGRAPHICS.CSV',
+            usecols=['Age_at_V1', 'PublicID', 'CRace'],
+            encoding='latin-1',
+        )
+        df_mother_demo = pd.merge(df_mother_demo, df_mother_num, on='PublicID', how='inner')
+        df_mother_demo[mother_numeric_features] = df_mother_demo[mother_numeric_features].apply(pd.to_numeric, errors='coerce')
+        df_healthcare = pd.read_csv(data_dir / 'V1A.CSV', usecols=healthcare_response_columns + ['PublicID'])
+        df_healthcare['has_healthcare'] = 0
+        for index, row in df_healthcare.iterrows():
+            for column in healthcare_response_columns:
+                if row[column] == 1:
+                    df_healthcare.at[index, 'has_healthcare'] = 1
+                    break
+                if row[column] == 0:
+                    df_healthcare.at[index, 'has_healthcare'] = 0
+                    break
+        df_mother_demo = pd.merge(df_mother_demo, df_healthcare[['PublicID', 'has_healthcare']], on='PublicID', how='inner')
+        df_mother_demo = df_mother_demo[~df_mother_demo['V1AF14'].isin(['D', 'R'])]
+
+    df_physical_activity = None
+    if include_physical_activity:
+        df_physical_activity = pd.read_csv(
+            data_dir / 'V2A.csv',
+            usecols=physical_activity_features + ['PublicID'],
+            low_memory=False,
+        )
+        df_physical_activity[physical_activity_features] = df_physical_activity[physical_activity_features].apply(pd.to_numeric, errors='coerce')
+
+    df_sleep = None
+    if include_sleep:
+        df_sleep = pd.read_csv(
+            data_dir / 'modified/SLEEP_ACTIGRAPHY_MODIFIED.CSV',
+            usecols=sleep_features + ['PublicID'],
+        )
+        df_sleep[sleep_features] = df_sleep[sleep_features].apply(pd.to_numeric, errors='coerce')
+
+    outcome_df = None
+    if include_outcome:
+        if outcome_path is None or outcome_column is None:
+            raise ValueError('outcome_path and outcome_column are required when include_outcome=True')
+        outcome_df = pd.read_csv(data_dir / outcome_path, usecols=['PublicID', outcome_column], encoding=outcome_encoding)
+        if outcome_replace_map is not None:
+            outcome_df[outcome_column] = outcome_df[outcome_column].replace(outcome_replace_map)
+        outcome_df[outcome_column] = pd.to_numeric(outcome_df[outcome_column], errors='coerce')
+        outcome_df = outcome_df.drop_duplicates(subset=['PublicID'])
+
+    combined_df = None
+    if include_maternal_physical:
+        combined_df = df_maternal_physical
+    if include_mental_health:
+        mental_health_features = compute_resilience_score(df_v2i)
+        mental_health_features = mental_health_features.merge(compute_stress_average(df_v1e), on='PublicID', how='outer')
+        mental_health_features = mental_health_features.merge(compute_hassles_uplifts(df_v3j), on='PublicID', how='outer')
+        mental_health_features = mental_health_features.merge(
+            compute_stress_level(pd.merge(df_v1a_stress, df_v3a_stress, on='PublicID', how='inner')),
+            on='PublicID',
+            how='outer',
+        )
+        combined_df = mental_health_features if combined_df is None else pd.merge(combined_df, mental_health_features, on='PublicID', how='left')
+    if include_paternal:
+        combined_df = df_paternal if combined_df is None else combined_df.merge(df_paternal, on='PublicID', how='left')
+    if include_drugs:
+        combined_df = df_drugs if combined_df is None else combined_df.merge(df_drugs, on='PublicID', how='left')
+    if include_food:
+        combined_df = df_food if combined_df is None else combined_df.merge(df_food, on='PublicID', how='left')
+    if include_health_knowledge:
+        combined_df = df_health_knowledge if combined_df is None else combined_df.merge(df_health_knowledge, on='PublicID', how='left')
+    if include_mother_demo:
+        combined_df = df_mother_demo if combined_df is None else combined_df.merge(df_mother_demo, on='PublicID', how='left')
+    if include_physical_activity:
+        combined_df = df_physical_activity if combined_df is None else combined_df.merge(df_physical_activity, on='PublicID', how='left')
+    if include_sleep:
+        combined_df = combined_df.merge(df_sleep, on='PublicID', how='left')
+    if include_outcome:
+        combined_df = combined_df.merge(outcome_df, on='PublicID', how='inner')
+        combined_df = combined_df.dropna(subset=[outcome_column]).copy()
+
+    return {
+        'combined_df': combined_df,
+        'outcome_df': outcome_df,
+        'feature_lists': feature_lists,
+        'maternal_physical_features': maternal_physical_features,
+        'paternal_features': paternal_features,
+        'drug_features': drug_features,
+        'food_features': food_features,
+        'health_knowledge_features': health_knowledge_features,
+        'mother_numeric_features': mother_numeric_features,
+        'mother_categorical_features': mother_categorical_features,
+        'physical_activity_features': physical_activity_features,
+        'sleep_features': sleep_features,
+    }
 
 
 def make_master_split_ids(df, target_column='MH_outcome', id_column='PublicID', test_size=0.2, random_state=42):
@@ -330,21 +849,14 @@ def run_model_experiment(
     if ordinal_features:
         resolved_ordinal_categories = {}
         for feature in ordinal_features:
-            if ordinal_feature_categories and feature in ordinal_feature_categories:
-                resolved_ordinal_categories[feature] = list(ordinal_feature_categories[feature])
-                continue
-
             series = X_train[feature]
-            if pd.api.types.is_categorical_dtype(series) and series.cat.ordered:
-                resolved_ordinal_categories[feature] = list(series.cat.categories)
-            elif pd.api.types.is_numeric_dtype(series):
-                resolved_ordinal_categories[feature] = sorted(pd.unique(series.dropna()).tolist())
-            else:
-                raise ValueError(
-                    f"Ordinal feature '{feature}' needs an explicit order. "
-                    "Pass ordinal_feature_categories or make the column an ordered "
-                    "pandas Categorical."
-                )
+            explicit_categories = None
+            if ordinal_feature_categories and feature in ordinal_feature_categories:
+                explicit_categories = ordinal_feature_categories[feature]
+            resolved_ordinal_categories[feature] = resolve_ordinal_categories(
+                series,
+                explicit_categories=explicit_categories,
+            )
 
     if not impute and feature_columns:
         train_mask = X_train[feature_columns].notna().all(axis=1) & y_train.notna()
