@@ -169,13 +169,24 @@ def plot_roc_curve_for_model(model, X_test, y_test, title='ROC Curve'):
     if not hasattr(model, 'predict_proba'):
         print('ROC curve skipped: model does not expose predict_proba().')
         return
-    unique_classes = np.unique(pd.Series(y_test).dropna())
+    y_true = pd.Series(y_test).dropna()
+    unique_classes = np.unique(y_true)
     if len(unique_classes) != 2:
         print('ROC curve skipped: multiclass targets are not plotted as a single ROC curve.')
         return
-    y_score = model.predict_proba(X_test)[:, 1]
-    RocCurveDisplay.from_predictions(y_test, y_score)
-    plt.title(f"{title} (AUC={roc_auc_score(y_test, y_score):.3f})")
+    positive_label = unique_classes[-1]
+
+    classifier, _ = _unwrap_classifier(model)
+    y_proba = model.predict_proba(X_test)
+    if hasattr(classifier, 'classes_') and positive_label in classifier.classes_:
+        positive_index = int(np.where(classifier.classes_ == positive_label)[0][0])
+    else:
+        positive_index = 1
+
+    y_score = y_proba[:, positive_index]
+    y_true_binary = (y_true == positive_label).astype(int)
+    RocCurveDisplay.from_predictions(y_true_binary, y_score)
+    plt.title(f"{title} (AUC={roc_auc_score(y_true_binary, y_score):.3f})")
     plt.tight_layout()
     plt.show()
 
