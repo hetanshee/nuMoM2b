@@ -82,16 +82,83 @@ def get_feature_names_from_pipeline(model, X_train=None):
     return None
 
 
-def plot_confusion_matrix_for_model(model, X_test, y_test, labels=None, title='Confusion Matrix'):
+def _unwrap_classifier(model):
+    """Return the fitted classifier and, when available, its inner estimator."""
+    classifier = model.named_steps['classifier'] if hasattr(model, 'named_steps') and 'classifier' in model.named_steps else model
+    inner_classifier = classifier
+
+    calibrated_classifiers = getattr(classifier, 'calibrated_classifiers_', None)
+    if calibrated_classifiers:
+        inner_classifier = getattr(calibrated_classifiers[0], 'estimator', inner_classifier)
+
+    return classifier, inner_classifier
+
+
+def _as_dense(matrix):
+    """Convert sparse or pandas-backed matrices to a dense ndarray for SHAP."""
+    if hasattr(matrix, 'toarray'):
+        return matrix.toarray()
+    if hasattr(matrix, 'to_numpy'):
+        return matrix.to_numpy()
+    return np.asarray(matrix)
+
+
+def _coefficient_importances(classifier):
+    """Return a 1D importance vector for linear models, or None if unsupported."""
+    coef = getattr(classifier, 'coef_', None)
+    if coef is None:
+        return None
+
+    coef = np.asarray(coef)
+    if coef.ndim == 1:
+        return np.abs(coef)
+    return np.mean(np.abs(coef), axis=0)
+
+
+def _drop_missing_rows(X, y=None):
+    """Drop rows with any missing values from X and align y if provided."""
+    if not hasattr(X, 'isna'):
+        return X, y
+
+    mask = ~X.isna().any(axis=1)
+    X_clean = X.loc[mask].copy()
+    if y is None:
+        return X_clean, None
+
+    y_series = pd.Series(y)
+    y_clean = y_series.loc[X_clean.index].copy()
+    return X_clean, y_clean
+
+
+def plot_confusion_matrix_for_model(
+    model,
+    X_test,
+    y_test,
+    labels=None,
+    display_labels=None,
+    title='Confusion Matrix',
+):
     y_pred = model.predict(X_test)
     y_true = pd.Series(y_test).dropna()
     y_pred = pd.Series(y_pred)
+    observed_labels = np.unique(pd.concat([y_true, y_pred], ignore_index=True))
+
     if labels is None:
-        labels = np.unique(pd.concat([y_true, y_pred], ignore_index=True))
+        labels = observed_labels
     else:
-        labels = np.unique(np.concatenate([np.asarray(labels), np.unique(pd.concat([y_true, y_pred], ignore_index=True))]))
+        labels = np.asarray(labels)
+        if display_labels is None and len(labels) == len(observed_labels):
+            expected_encoded = np.array_equal(observed_labels, np.arange(len(observed_labels)))
+            provided_human_labels = not np.array_equal(labels, observed_labels)
+            if expected_encoded and provided_human_labels:
+                display_labels = labels
+                labels = observed_labels
+        if display_labels is None:
+            labels = np.unique(np.concatenate([labels, observed_labels]))
+            display_labels = labels
+
     cm = confusion_matrix(y_test, y_pred, labels=labels)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
     disp.plot(cmap='Blues', values_format='d')
     plt.title(title)
     plt.tight_layout()
@@ -115,13 +182,15 @@ def plot_roc_curve_for_model(model, X_test, y_test, title='ROC Curve'):
 
 def plot_model_feature_importance(model, X_train=None, top_n=20, title='Feature Importance'):
     feature_names = get_feature_names_from_pipeline(model, X_train)
-    classifier = model.named_steps['classifier'] if hasattr(model, 'named_steps') and 'classifier' in model.named_steps else model
+    classifier, inner_classifier = _unwrap_classifier(model)
 
     if hasattr(classifier, 'feature_importances_'):
-        importances = classifier.feature_importances_
-    elif hasattr(classifier, 'coef_'):
-        importances = np.abs(np.ravel(classifier.coef_))
+        importances = np.asarray(classifier.feature_importances_)
     else:
+        importances = _coefficient_importances(classifier)
+        if importances is None and inner_classifier is not classifier:
+            importances = _coefficient_importances(inner_classifier)
+    if importances is None:
         print('Feature importance skipped: model does not expose coefficients or feature_importances_.')
         return None
 
@@ -168,19 +237,41 @@ def plot_permutation_importance_for_model(model, X_test, y_test, top_n=20, title
 
 def plot_shap_summary_for_model(model, X_train, X_test, max_display=20, sample_size=500):
     """Generate SHAP summary plots for tree-based or linear models when supported."""
-    classifier = model.named_steps['classifier'] if hasattr(model, 'named_steps') and 'classifier' in model.named_steps else model
+    classifier, inner_classifier = _unwrap_classifier(model)
     feature_names = get_feature_names_from_pipeline(model, X_train)
 
+    X_background = X_train.sample(min(sample_size, len(X_train)), random_state=42) if len(X_train) > sample_size else X_train
     X_shap = X_test.sample(min(sample_size, len(X_test)), random_state=42) if len(X_test) > sample_size else X_test
 
     try:
         if hasattr(model, 'named_steps') and 'preprocessor' in model.named_steps:
+            X_background_transformed = model.named_steps['preprocessor'].transform(X_background)
             X_shap_transformed = model.named_steps['preprocessor'].transform(X_shap)
         else:
+            X_background_transformed = X_background
             X_shap_transformed = X_shap
 
-        explainer = shap.Explainer(classifier, X_shap_transformed)
-        shap_values = explainer(X_shap_transformed)
+        X_background_transformed = _as_dense(X_background_transformed)
+        X_shap_transformed = _as_dense(X_shap_transformed)
+        masker = shap.maskers.Independent(X_background_transformed, max_samples=len(X_background_transformed))
+
+        if isinstance(inner_classifier, XGBClassifier) or hasattr(inner_classifier, 'get_booster'):
+            explainer = shap.TreeExplainer(
+                inner_classifier,
+                data=X_background_transformed,
+                feature_perturbation='tree_path_dependent',
+            )
+            shap_values = explainer(X_shap_transformed)
+        elif _coefficient_importances(inner_classifier) is not None:
+            explainer = shap.LinearExplainer(inner_classifier, masker)
+            shap_values = explainer(X_shap_transformed)
+        elif hasattr(classifier, 'predict_proba'):
+            explainer = shap.Explainer(classifier.predict_proba, masker)
+            shap_values = explainer(X_shap_transformed)
+        else:
+            explainer = shap.Explainer(classifier, masker)
+            shap_values = explainer(X_shap_transformed)
+
         shap.summary_plot(shap_values, X_shap_transformed, feature_names=feature_names, max_display=max_display, show=True)
         return shap_values
     except Exception as exc:
@@ -190,6 +281,17 @@ def plot_shap_summary_for_model(model, X_train, X_test, max_display=20, sample_s
 
 def run_interpretability_suite(model, X_train, X_test, y_test, labels=None, top_n=20):
     """Run the standard interpretability outputs."""
+    try:
+        model.predict(X_test)
+    except ValueError as exc:
+        message = str(exc)
+        if 'NaN' in message or 'missing values' in message:
+            print('Interpretability input contains missing values; dropping incomplete rows for this model.')
+            X_test, y_test = _drop_missing_rows(X_test, y_test)
+            X_train, _ = _drop_missing_rows(X_train)
+        else:
+            raise
+
     plot_confusion_matrix_for_model(model, X_test, y_test, labels=labels)
     plot_roc_curve_for_model(model, X_test, y_test)
     plot_model_feature_importance(model, X_train=X_train, top_n=top_n)
@@ -1024,6 +1126,7 @@ def run_model_experiment(
     print(f"Best CV Score ({scoring}): {grid_search.best_score_:.4f}")
 
     classifier = best_model.named_steps['classifier']
+    _, inner_classifier = _unwrap_classifier(best_model)
     try:
         feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
     except AttributeError:
@@ -1034,7 +1137,19 @@ def run_model_experiment(
             feature_names.extend(categorical_features)
     feature_names = np.asarray(feature_names)
     if model_name.lower() == 'svm':
-        print('Skipping feature-level SVM output to keep notebook output compact.')
+        svm_coef = getattr(inner_classifier, 'coef_', None)
+        if svm_coef is not None:
+            svm_coef = np.asarray(svm_coef)
+            if svm_coef.ndim == 1 or svm_coef.shape[0] == 1:
+                coef_vector = svm_coef.ravel()
+                print('Model Coefficients (inner linear SVM):')
+            else:
+                coef_vector = np.mean(np.abs(svm_coef), axis=0)
+                print('Model Coefficients (mean absolute across classes for linear SVM):')
+            for feature, coef in zip(feature_names[: len(coef_vector)], coef_vector):
+                print(f"{feature}: {coef}")
+        else:
+            print('Skipping feature-level SVM output: non-linear SVM has no coefficients.')
     elif hasattr(classifier, 'coef_'):
         print('Model Coefficients:')
         for feature, coef in zip(feature_names[: len(classifier.coef_[0])], classifier.coef_[0]):
